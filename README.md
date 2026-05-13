@@ -682,48 +682,155 @@ The GPU's solve time grows only 28× across a **10× wider** problem range than 
 
 ---
 
-## 9. Summary
+## 9. Hybrid B-OA: cuOpt as the MILP Sub-Solver
+
+An alternative approach to running the MINLP on GPU is to keep Bonmin's B-OA structure intact but **replace its CBC MILP sub-solver with cuOpt**. This hybrid keeps IPOPT for the NLP sub-problems (which remain non-linear) while offloading each MILP master solve to the GPU.
+
+### 9.1 Algorithm
+
+```
+Phase 0  NLP relaxation (z continuous, IPOPT) → initial OA cuts
+
+Repeat until converged:
+  A. MILP master  →  cuOpt GPU
+       min  η   (epigraph variable lower-bounding the true objective)
+       s.t. η ≥ linearised objective tangent cut at each past NLP solution
+            linearised ball tangent cut at each past NLP solution
+            original coupling constraint
+     → LB = η*,  integer candidate ẑ
+
+  B. NLP fix  →  IPOPT
+       Fix z = ẑ, solve continuous NLP
+     → UB = min(UB, f(x̄, ẑ));  add new OA cuts at (x̄, ẑ)
+
+  Converge when (UB − LB) / max(1, |UB|) < tol
+```
+
+**Key difference from the direct cuOpt MIP:** the hybrid solves the problem with the **exact L2 objective** (not L1) and the **exact ball constraint** (not the dropped-square linearisation). The non-linearity is handled iteratively by the OA cuts, not by a one-shot reformulation.
+
+### 9.2 Result: Simple 3-Variable Problem
+
+`hybrid_boa_cuopt.py` applies this hybrid to the original `minlp_pyomo.py` problem:
+
+```
+                      Hybrid B-OA          Bonmin (IPOPT+CBC)
+                      ────────────────────  ────────────────────
+  MILP sub-solver     cuOpt GPU            CBC (CPU)
+  Iterations          4                    2
+  x                   1.000000             1.000000   ✓ match
+  y                   1.000000             1.000000   ✓ match
+  z                   1                    1          ✓ match
+  Objective (L2)      0.250000             0.250000   ✓ match
+  IPOPT time          47.5 ms              —
+  MILP time           1711 ms              —
+  Total               1758 ms              9.6 ms
+```
+
+The hybrid finds the exact same globally optimal solution as Bonmin. The GPU is slower here — for a 4-variable MILP, CUDA initialisation (~700 ms) dominates.
+
+### 9.3 Scaling Benchmark
+
+`hybrid_boa_scaling.py` runs the hybrid over all 10 benchmark sizes. The MILP master at iteration T has T·n ball tangent cuts (one per x_i per past NLP solution) plus T objective cuts.
+
+```
+    size       n   k iters       nlp  milp-build  milp-solve      total    objective     f*   status
+────────────────────────────────────────────────────────────────────────────────────────────────────
+    tiny      10   1     2       33ms          0ms       1703ms      1736ms       0.0900 0.0900   optimal
+   small      50   1     2       28ms          1ms       1527ms      1556ms       0.0900 0.0900   optimal
+  small+     200   2     3       52ms          5ms       2294ms      2352ms       0.1800 0.1800   optimal
+ medium-     600   2     3      109ms         16ms       2299ms      2425ms       0.1800 0.1800   optimal
+  medium    1500   2     3      236ms         61ms       3490ms      3789ms       0.1800 0.1800   optimal
+ medium+    3000   2     4      642ms        338ms      11866ms     12852ms       0.1800 0.1800   optimal
+  large-    5000   4     4     1011ms        745ms      50966ms     52733ms       0.3600 0.3600   optimal
+   large   10000   4     4     2545ms       2456ms     169584ms    174606ms       0.3600 0.3600   optimal
+  large+   20000   4     4     5231ms       9238ms     388343ms    402858ms       0.3600 0.3600   milp_infeas*
+  xlarge   50000   6     1     6365ms      11691ms     301850ms    319922ms          --- 0.5400   milp_infeas
+────────────────────────────────────────────────────────────────────────────────────────────────────
+```
+
+*large+: found the correct optimum in an earlier iteration; final MILP timed out before certifying the lower bound.
+
+### 9.4 Three-Way Comparison
+
+| size | **Bonmin** | **Direct cuOpt MIP** | **Hybrid B-OA** | Winner |
+|------|-----------|----------------------|-----------------|--------|
+| tiny (n=10) | 13.7 ms | 1 058 ms | 1 736 ms | Bonmin |
+| small (n=50) | 9.6 ms | 693 ms | 1 556 ms | Bonmin |
+| medium (n=1500) | 493 ms | 816 ms | 3 789 ms | Bonmin |
+| medium+ (n=3000) | 1 043 ms | 2 256 ms | 12 852 ms | Bonmin |
+| large- (n=5000) | 33 908 ms | **2 276 ms** | 52 733 ms | **Direct cuOpt** |
+| large (n=10000) | > 60 s | **2 817 ms** | 174 606 ms | **Direct cuOpt** |
+| large+ (n=20000) | > 60 s | **6 402 ms** | 402 858 ms† | **Direct cuOpt** |
+| xlarge (n=50000) | > 60 s | **19 203 ms** | > 300 s† | **Direct cuOpt** |
+
+†Did not certify global optimum within time limit.
+
+**The direct cuOpt MIP (one-shot linearisation) beats the hybrid at every size where the GPU wins.** Replacing CBC with cuOpt inside B-OA does not recover the GPU speed advantage because:
+
+1. **T·n cut explosion:** each B-OA iteration adds n ball cuts to the MILP master. After T=4 iterations at n=10000, the MILP has 40000 constraints — much more than the direct MIP's 30005. More constraints means harder LP relaxations, not easier.
+2. **Sequential GPU round-trips:** each iteration pays the CUDA communication overhead. The direct MIP pays it once.
+3. **PDLP vs simplex for sequential solving:** CBC's warm-starting dual simplex efficiently re-uses the previous LP basis. PDLP restarts from scratch each time.
+
+### 9.5 How to Improve the Hybrid
+
+The T·n cut explosion is the structural bottleneck. Two fixes would eliminate it:
+
+**Aggregate by group (biggest win):** All x_i in group g are symmetric — at optimality they are all equal. Replace the n x_i variables with k group representatives X_g. The MILP collapses from O(n) to O(k) variables and T·k ball cuts regardless of n. For k=4 the entire MILP has 9 variables.
+
+**Use HiGHS as the MILP sub-solver:** HiGHS (`pip install highspy`) is an open-source parallel CPU solver with warm-starting dual simplex. For the small 2k+1-variable aggregated MILP it would solve in microseconds per iteration — eliminating GPU latency entirely.
+
+With these two changes, the hybrid B-OA would correctly solve the true non-linear MINLP (not a linearised proxy) at any n in milliseconds per iteration.
+
+---
+
+## 10. Summary
 
 ### What We Did
 
 | Step | Action |
 |------|--------|
 | 1 | Defined and solved the 3-variable MINLP with Bonmin (CPU). Result: x=1, y=1, z=1, objective=0.25 in 10.6 ms. |
-| 2 | Attempted to run the same problem on cuOpt — impossible directly because cuOpt requires linear constraints and a linear objective. |
-| 3 | Reformulated the MINLP as a linear MIP: replaced quadratic objective with L1, replaced ball constraint with 9 outer-approximation tangent planes. |
-| 4 | Solved the reformulated MIP with cuOpt. Result: x=1, y=1, z=1 — identical to Bonmin. |
-| 5 | Extended both benchmarks to 10 sizes each to locate the performance crossover. |
+| 2 | Attempted to run the same problem on cuOpt — impossible directly (cuOpt requires linear constraints and objective). |
+| 3 | Reformulated as linear MIP: L1 objective + 9 OA tangent planes. cuOpt returns x=1, y=1, z=1 — identical to Bonmin. |
+| 4 | Generalised both solvers to 10 benchmark sizes (n=10 to 50000). |
+| 5 | Implemented Hybrid B-OA: IPOPT for NLP sub-problems, cuOpt GPU for MILP master. Tested on simple and scaled problems. |
 
 ### Key Findings
 
-1. **The reformulated cuOpt MIP returns the exact same optimal solution** (x=1, y=1, z=1) as Bonmin. The L2 objective value at that point is 0.25 in both cases. The OA linearisation of the ball constraint and the L1 objective transformation preserve the solution point.
+1. **The reformulated cuOpt MIP and the hybrid B-OA both return the exact same optimal solution** (x=1, y=1, z=1, objective=0.25) as Bonmin. L1 vs L2 objectives differ in value but agree on the optimal point.
 
-2. **For small problems, the CPU (Bonmin) is faster.** GPU initialisation overhead (~700 ms) dominates for problems with fewer than ~3000 continuous variables. Bonmin solves the tiny 3-variable problem in 10.6 ms; cuOpt takes 1054 ms.
+2. **For small problems, the CPU (Bonmin) is fastest.** GPU initialisation overhead (~700 ms) dominates for n < 3000. Bonmin solves the 3-variable problem in 10.6 ms; cuOpt takes 1054 ms; the hybrid takes 1758 ms.
 
-3. **The crossover occurs at approximately n=5000, k=4.** At this size, Bonmin takes 34 seconds (exponential B&B growth with k=4 integer variables) while cuOpt takes only 2.3 seconds — a **15× GPU advantage**. Beyond this size, only cuOpt can solve the problem within reasonable time.
+3. **The crossover to GPU advantage is at n≈5000, k=4.** The direct cuOpt MIP is 15× faster than Bonmin there (2.3 s vs 34 s) and extends to problems Bonmin cannot solve within 60 s.
 
-4. **The GPU's scaling advantage is qualitatively different.** Bonmin's MINLP solve time grows 3545× over a 100× problem-size increase. cuOpt's MIP solve time grows only 28× over a 1000× problem-size increase. The GPU excels not just by being faster, but by scaling more gracefully.
+4. **The direct cuOpt MIP beats the hybrid B-OA at every size.** The hybrid's T·n ball cut accumulation makes its MILP larger than the direct formulation's compact 3n+2k+1 constraints. Multiple sequential GPU calls also can't amortise CUDA overhead as well as a single large solve.
 
-5. **The linearisation is the bottleneck on the Python side, not the GPU.** At n=50000, the Python loop constructing the model takes 14.6 seconds — the same order of magnitude as the 19.2-second GPU solve. This Python overhead can be eliminated by using a compiled model-builder or the sparse-matrix DataModel API.
+5. **GPU scaling is qualitatively different from CPU.** Bonmin's MINLP grows 3545× over a 100× problem-size range. Direct cuOpt grows 28× over a 1000× range. The GPU advantages compound as n grows.
+
+6. **Python model-build time becomes the bottleneck at very large n.** At n=50000, Python's `addConstraint` loops take 14.6 s in the direct MIP and 11.7 s in the hybrid (for 1 iteration). Eliminating this via a compiled model-builder or the sparse-matrix DataModel API would unlock further speed.
 
 ### When to Use Each Solver
 
 | Scenario | Recommended solver | Reason |
 |----------|-------------------|--------|
-| Small MINLP (n < 1500, k ≤ 4) with non-linear constraints | **Bonmin (B-OA)** | Fast CPU solve; avoids GPU setup overhead; handles non-linearity natively |
-| Large MIP (n > 5000) with linear constraints | **cuOpt (GPU)** | Near-linear GPU scaling; no B&B branching on well-structured problems |
-| Non-linear constraints at large scale | **Neither directly** — use decomposition (B-OA/IPOPT on CPU) or SCP/convexification on GPU | cuOpt requires linearity; Bonmin's B-OA cost grows exponentially with k |
+| Small MINLP (n < 1500) with non-linear constraints | **Bonmin (B-OA)** | Fast; avoids GPU setup; handles non-linearity natively |
+| Large MIP (n > 5000) with linearisable constraints | **Direct cuOpt MIP** | One-shot solve; near-linear GPU scaling; no B-OA overhead |
+| Non-linear MINLP at large scale | **Hybrid B-OA with aggregated MILP + HiGHS** | Aggregate x_i by group (O(k) MILP), use CPU simplex for warm-starting |
+| Very large linear LP only (no integers) | **Direct cuOpt PDLP** | PDLP is fastest for pure LP at GPU scale |
 
 ---
 
-## 10. Files
+## 11. Files
 
 | File | Description |
 |------|-------------|
-| `minlp_pyomo.py` | Original MINLP solved with Bonmin (B-OA) via Pyomo |
-| `minlp_pyomo_cuopt.py` | Same problem reformulated as linear MIP and solved with cuOpt |
-| `minlp_scaling.py` | 10-size scalable MINLP benchmark (Bonmin) |
-| `mip_cuopt_scaling.py` | 10-size scalable Linear MIP benchmark (cuOpt) |
-| `minlp_scaling_results.md` | Detailed Bonmin benchmark results and analysis |
-| `mip_cuopt_scaling_results.md` | Detailed cuOpt benchmark results and analysis |
-| `optimization_report.md` | This report |
+| `minlp_pyomo.py` | Original 3-variable MINLP, solved with Bonmin (B-OA) via Pyomo |
+| `minlp_pyomo_cuopt.py` | Same problem reformulated as linear MIP with L1 + 9 OA cuts, solved with cuOpt |
+| `minlp_scaling.py` | 10-size scalable MINLP benchmark (Bonmin, CPU) |
+| `mip_cuopt_scaling.py` | 10-size scalable Linear MIP benchmark (cuOpt, GPU) |
+| `hybrid_boa_cuopt.py` | Hybrid B-OA on the 3-variable problem: IPOPT NLP + cuOpt GPU MILP master |
+| `hybrid_boa_scaling.py` | Hybrid B-OA scaling benchmark across all 10 sizes |
+| `minlp_scaling_results.md` | Bonmin MINLP benchmark results and analysis |
+| `mip_cuopt_scaling_results.md` | Direct cuOpt Linear MIP benchmark results and analysis |
+| `hybrid_boa_scaling_results.md` | Hybrid B-OA benchmark results and three-way comparison |
+| `optimization_report.md` | Comprehensive narrative report covering all experiments |
